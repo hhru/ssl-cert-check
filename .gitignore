@@ -18,6 +18,18 @@ ehthumbs.db
 Thumbs.db
 Desktop.ini
 
+# build
+build
+debian/*.debhelper
+debian/*.substvars
+debian/files
+debian/hh-ssl-cert-check
+debian/pycompat
+debian/python-module-stampdir/
+dist/
+hh_ssl_cert_check.egg-info/
+.eggs/
+
 #virtualenv
 venv/
 

@@ -1,0 +1,13 @@
+#!/usr/bin/env python
+from __future__ import unicode_literals, print_function
+import sys
+
+RETURN_CODE_OK = 0
+
+
+def main(args):
+    print(args)
+    return RETURN_CODE_OK
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

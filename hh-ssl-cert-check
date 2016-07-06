@@ -1,13 +1,131 @@
 #!/usr/bin/env python
+# encoding: utf-8
 from __future__ import unicode_literals, print_function
 import sys
+import argparse
+import os
+import subprocess
+from collections import namedtuple
+from functools import partial
+try:
+    from cStringIO import StringIO
+except ImportError:
+    from StringIO import StringIO
 
 RETURN_CODE_OK = 0
+RETURN_CODE_WRONG_PARAMS = 1
+RETURN_CODE_WARNING = 2
+
+
+def to_bytes(value):
+    if isinstance(value, unicode):
+        return value.encode(encoding='utf-8')
+    elif isinstance(value, str):
+        return value
+    else:
+        return str(value)
+
+
+def is_executable_found(bin):
+
+    def _is_exe(file_path):
+        return os.path.isfile(file_path) and os.access(file_path, os.X_OK)
+
+    dirname, basename = os.path.split(bin)
+    if dirname:
+        return _is_exe(bin)
+    else:
+        for path_item in os.environ.get('PATH', '').split(os.pathsep):
+            path_item = path_item.strip('"')
+            full_path = os.path.join(path_item, basename)
+            if _is_exe(full_path):
+                return True
+    return False
+
+
+CallProcessResult = namedtuple('CallProcessResult', ['bin_exists', 'return_code', 'stdout', 'stderr'])
+
+
+def call_process(bin, args=None, stdin=None):
+    if not is_executable_found(bin):
+        print('''not found "{}", check if it's installed and exists somewhere in PATH ({})'''
+              .format(bin, os.environ.get('PATH', '')))
+        return CallProcessResult(bin_exists=False, return_code=None, stdout=None, stderr=None)
+    args = args or []
+    call_args = [bin] + args
+    process = subprocess.Popen(call_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               stdin=subprocess.PIPE if stdin is not None else None)
+    stdin_bytes = to_bytes(stdin) if stdin is not None else None
+    (stdout, stderr) = process.communicate(input=stdin_bytes)
+    return CallProcessResult(bin_exists=True, return_code=process.returncode, stdout=stdout, stderr=stderr)
+
+openssl = partial(call_process, 'openssl')
+
+
+class P12Check(object):
+
+    @staticmethod
+    def init_argparser(subparsers):
+        parser = subparsers.add_parser(b'p12', help='check a certificate in a PKCS #12 container (.p12)')
+        parser.add_argument('-c', '--cert', type=str, help='certificate file path', required=True, metavar='file.p12')
+        parser.add_argument('-p', '--password', type=str, help='certificate password')
+        return parser
+
+    def __call__(self, env):
+        print('p12')
+        return RETURN_CODE_OK
+
+
+class HttpsCheck(object):
+
+    @staticmethod
+    def init_argparser(subparsers):
+        parser = subparsers.add_parser(b'https', help='check a HTTPS certficate by receiving it from a SSL connection')
+        parser.add_argument('-s', '--host', type=str, required=True, metavar='example.com')
+        parser.add_argument('-p', '--port', type=int, default=443, metavar='443')
+        return parser
+
+    def __call__(self, env):
+        print('https')
+        return RETURN_CODE_OK
+
+
+class PemCheck(object):
+
+    @staticmethod
+    def init_argparser(subparsers):
+        parser = subparsers.add_parser(b'pem', help='check a PEM certificate')
+        parser.add_argument('-c', '--cert', type=str, help='certificate file path', required=True, metavar='file.crt')
+        return parser
+
+    def __call__(self, env):
+        print('pem')
+        return RETURN_CODE_OK
+
+_COMMANDS = [P12Check, HttpsCheck, PemCheck]
+
+
+def _parse_aguments(args):
+    main_parser = argparse.ArgumentParser()
+    main_parser.add_argument('-x', '--expiration-interval', required=True, type=int, default=7, metavar='7',
+                             help='expiration interval in days')
+
+    subparsers = main_parser.add_subparsers(title='commands', dest='command',
+                                            help="use 'cmd -h' to see additional command specific help")
+    command_to_class = {}
+    for command in _COMMANDS:
+        parser = command.init_argparser(subparsers)
+        command_to_class[parser.prog.split(' ')[-1]] = command
+    parsed_arguments = main_parser.parse_args(args[1:])
+    selected_command = command_to_class[parsed_arguments.command]
+    return parsed_arguments, selected_command
 
 
 def main(args):
-    print(args)
-    return RETURN_CODE_OK
+    parsed_arguments, selected_command = _parse_aguments(args)
+    handler = selected_command()
+    return handler(parsed_arguments)
+
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv))

@@ -248,8 +248,19 @@ class PemCheck(object):
         return parser
 
     def __call__(self, env):
-        print('pem')
-        return RETURN_CODE_OK
+        certificate_abs_path = os.path.abspath(env.cert)
+        if not os.path.isfile(certificate_abs_path):
+            warning('Certificate not found at {}'.format(certificate_abs_path))
+            return RETURN_CODE_WRONG_PARAMS
+
+        info_res = x509(['-in', certificate_abs_path, '-subject', '-dates', '-noout'])
+        if info_res.return_code != 0:
+            warning('Unable to read certificate info for {d}\n{r.stderr}'.format(d=certificate_abs_path, r=info_res))
+            return RETURN_CODE_WARNING
+
+        return parse_and_check_certificate_info(info_res.stdout.decode('utf-8'), env,
+                                                certificate_description='file {}'.format(certificate_abs_path))
+
 
 _COMMANDS = [P12Check, HttpsCheck, PemCheck]
 

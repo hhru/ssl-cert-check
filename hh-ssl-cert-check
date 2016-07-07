@@ -6,11 +6,7 @@ import argparse
 import os
 import subprocess
 from collections import namedtuple
-from functools import partial
-try:
-    from cStringIO import StringIO
-except ImportError:
-    from StringIO import StringIO
+import datetime
 
 RETURN_CODE_OK = 0
 RETURN_CODE_WRONG_PARAMS = 1
@@ -24,6 +20,13 @@ def to_bytes(value):
         return value
     else:
         return str(value)
+
+
+def warning(message):
+    sys.stderr.write(message + '\n')
+
+
+info = print
 
 
 def is_executable_found(bin):
@@ -47,9 +50,12 @@ CallProcessResult = namedtuple('CallProcessResult', ['bin_exists', 'return_code'
 
 
 def call_process(bin, args=None, stdin=None):
+    """
+    :return CallProcessResult
+    """
     if not is_executable_found(bin):
-        print('''not found "{}", check if it's installed and exists somewhere in PATH ({})'''
-              .format(bin, os.environ.get('PATH', '')))
+        warning('''not found "{}", check if it's installed and exists somewhere in PATH ({})'''
+                .format(bin, os.environ.get('PATH', '')))
         return CallProcessResult(bin_exists=False, return_code=None, stdout=None, stderr=None)
     args = args or []
     call_args = [bin] + args
@@ -59,7 +65,47 @@ def call_process(bin, args=None, stdin=None):
     (stdout, stderr) = process.communicate(input=stdin_bytes)
     return CallProcessResult(bin_exists=True, return_code=process.returncode, stdout=stdout, stderr=stderr)
 
-openssl = partial(call_process, 'openssl')
+
+def openssl(args=None, stdin=None):
+    """
+    :return CallProcessResult
+    """
+    return call_process(bin='openssl', args=args, stdin=stdin)
+
+
+def pkcs12(args, stdin=None):
+    """
+    :return CallProcessResult
+    """
+    return openssl(args=['pkcs12'] + args if args is not None else [], stdin=stdin)
+
+
+def x509(args, stdin=None):
+    """
+    :return CallProcessResult
+    """
+    return openssl(args=['x509'] + args if args is not None else [], stdin=stdin)
+
+
+def parse_certificate_fields(content):
+    fields = {}
+    for line in (l for l in content.split('\n') if l.strip() != ''):
+        key, _, value = line.partition('=')
+        fields[key] = value
+    return fields
+
+
+def parse_date_field(value):
+    try:
+        # ex: Aug 30 23:59:59 2016 GMT
+        return datetime.datetime.strptime(value, '%b %d %H:%M:%S %Y %Z')
+    except ValueError:
+        return None
+
+
+def is_safe_expire_date(expire_date, expiration_interval, now=None):
+    delta = expire_date - now
+    return delta >= datetime.timedelta(days=expiration_interval)
 
 
 class P12Check(object):
@@ -72,7 +118,53 @@ class P12Check(object):
         return parser
 
     def __call__(self, env):
-        print('p12')
+        certificate_abs_path = os.path.abspath(env.cert)
+        if not os.path.isfile(certificate_abs_path):
+            warning('Certificate not found at {}'.format(certificate_abs_path))
+            return RETURN_CODE_WRONG_PARAMS
+        certificate_export_res = pkcs12([
+            '-in', certificate_abs_path,
+            '-nodes',  # don't encrypt private keys on exporting
+            '-passin', 'pass:{}'.format(env.password if env.password is not None else '')
+        ])
+        if certificate_export_res.return_code != 0:
+            warning('Unable to load certificate from {p}\n{r.stderr}'
+                    .format(p=certificate_abs_path, r=certificate_export_res))
+            return RETURN_CODE_WARNING
+        info_res = x509(['-subject', '-dates', '-noout'], stdin=certificate_export_res.stdout)
+        if info_res.return_code != 0:
+            warning('Unable to read certificate info for {p}\n{r.stderr}'.format(p=certificate_abs_path, r=info_res))
+            return RETURN_CODE_WARNING
+        info_fields = parse_certificate_fields(info_res.stdout.decode('utf-8'))
+        if 'notAfter' not in info_fields:
+            warning('Unable to read expire date for {}'.format(certificate_abs_path))
+            return RETURN_CODE_WARNING
+
+        raw_expire_date = info_fields['notAfter']
+        expire_date = parse_date_field(raw_expire_date)
+        cert_subject = info_fields.get('subject', '<unknown>')
+
+        if not is_safe_expire_date(expire_date, env.expiration_interval, now=env.now):
+            warning(
+                (
+                    'Certificate has expired or is about to expire.\n'
+                    'Certificate path: {path}\n'
+                    'Certificate subject: {subj}\n'
+                    'Expire date: {expire}'
+                ).format(path=certificate_abs_path, subj=cert_subject, expire=raw_expire_date)
+            )
+            return RETURN_CODE_WARNING
+
+        if env.info:
+            info(
+                (
+                    'Certificate path: {path}\n'
+                    'Certificate subject: {subj}\n'
+                    'Expire date: {expire}\n'
+                    'Valid after: {after}'
+                ).format(path=certificate_abs_path, subj=cert_subject, expire=raw_expire_date,
+                         after=info_fields.get('notBefore', '<unknown>'))
+            )
         return RETURN_CODE_OK
 
 
@@ -107,11 +199,16 @@ _COMMANDS = [P12Check, HttpsCheck, PemCheck]
 
 def _parse_aguments(args):
     main_parser = argparse.ArgumentParser()
+    main_parser.add_argument('-i', '--info', action='store_true',
+                             help="print certificate info if it's valid")
     main_parser.add_argument('-x', '--expiration-interval', required=True, type=int, default=7, metavar='7',
                              help='expiration interval in days')
 
     subparsers = main_parser.add_subparsers(title='commands', dest='command',
                                             help="use 'cmd -h' to see additional command specific help")
+
+    main_parser.set_defaults(now=datetime.datetime.now())
+
     command_to_class = {}
     for command in _COMMANDS:
         parser = command.init_argparser(subparsers)
@@ -123,6 +220,9 @@ def _parse_aguments(args):
 
 def main(args):
     parsed_arguments, selected_command = _parse_aguments(args)
+    if parsed_arguments.expiration_interval < 0:
+        warning("Expiration interval should be >= 0")
+        return RETURN_CODE_WRONG_PARAMS
     handler = selected_command()
     return handler(parsed_arguments)
 

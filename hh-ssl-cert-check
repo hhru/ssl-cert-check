@@ -26,7 +26,29 @@ def warning(message):
     sys.stderr.write(message + '\n')
 
 
-info = print
+class EmailReporter(object):
+
+    def __init__(self):
+        self._info = []
+
+    def add_additional_info(self, content):
+        self._info.append(content)
+
+    def send(self, to):
+        subject = 'Warn! Certificate has expired or is about to expire'
+        msg = MIMEText('\n'.join(self._info), _charset="utf-8")
+
+        hostname = socket.gethostname()
+        me = '{}@{}'.format(os.getlogin(), hostname)
+
+        msg[b'Subject'] = subject
+        msg[b'From'] = me
+        msg[b'To'] = to
+        msg[b'list-id'] = b'certificates warnings <certificates-warnings.{}>'.format(hostname)
+
+        s = smtplib.SMTP(b'localhost')  # TODO: additional smtp settings
+        s.sendmail(me, [to], msg.as_string())
+        s.quit()
 
 
 def is_executable_found(bin):
@@ -87,6 +109,13 @@ def x509(args, stdin=None):
     return openssl(args=['x509'] + args if args is not None else [], stdin=stdin)
 
 
+def s_client(args, stdin=b''):
+    """
+    :return CallProcessResult
+    """
+    return openssl(args=['s_client'] + args if args is not None else [], stdin=stdin)
+
+
 def parse_certificate_fields(content):
     fields = {}
     for line in (l for l in content.split('\n') if l.strip() != ''):
@@ -108,6 +137,40 @@ def is_safe_expire_date(expire_date, expiration_interval, now=None):
     return delta >= datetime.timedelta(days=expiration_interval)
 
 
+def parse_and_check_certificate_info(content, env, certificate_description):
+    info_fields = parse_certificate_fields(content)
+    if 'notAfter' not in info_fields:
+        warning('Unable to read expire date for {}'.format(certificate_description))
+        return RETURN_CODE_WARNING
+
+    raw_expire_date = info_fields['notAfter']
+    expire_date = parse_date_field(raw_expire_date)
+    cert_subject = info_fields.get('subject', '<unknown>')
+
+    if not is_safe_expire_date(expire_date, env.expiration_interval, now=env.now):
+        warning(
+            (
+                'Certificate has expired or is about to expire.\n'
+                'Certificate: {description}\n'
+                'Certificate subject: {subj}\n'
+                'Expire date: {expire}'
+            ).format(description=certificate_description, subj=cert_subject, expire=raw_expire_date)
+        )
+        return RETURN_CODE_WARNING
+
+    if env.info:
+        print(
+            (
+                'Certificate: {description}\n'
+                'Certificate subject: {subj}\n'
+                'Expire date: {expire}\n'
+                'Valid after: {after}'
+            ).format(description=certificate_description, subj=cert_subject, expire=raw_expire_date,
+                     after=info_fields.get('notBefore', '<unknown>'))
+        )
+    return RETURN_CODE_OK
+
+
 class P12Check(object):
 
     @staticmethod
@@ -122,6 +185,7 @@ class P12Check(object):
         if not os.path.isfile(certificate_abs_path):
             warning('Certificate not found at {}'.format(certificate_abs_path))
             return RETURN_CODE_WRONG_PARAMS
+
         certificate_export_res = pkcs12([
             '-in', certificate_abs_path,
             '-nodes',  # don't encrypt private keys on exporting
@@ -131,55 +195,48 @@ class P12Check(object):
             warning('Unable to load certificate from {p}\n{r.stderr}'
                     .format(p=certificate_abs_path, r=certificate_export_res))
             return RETURN_CODE_WARNING
+
         info_res = x509(['-subject', '-dates', '-noout'], stdin=certificate_export_res.stdout)
         if info_res.return_code != 0:
             warning('Unable to read certificate info for {p}\n{r.stderr}'.format(p=certificate_abs_path, r=info_res))
             return RETURN_CODE_WARNING
-        info_fields = parse_certificate_fields(info_res.stdout.decode('utf-8'))
-        if 'notAfter' not in info_fields:
-            warning('Unable to read expire date for {}'.format(certificate_abs_path))
-            return RETURN_CODE_WARNING
 
-        raw_expire_date = info_fields['notAfter']
-        expire_date = parse_date_field(raw_expire_date)
-        cert_subject = info_fields.get('subject', '<unknown>')
-
-        if not is_safe_expire_date(expire_date, env.expiration_interval, now=env.now):
-            warning(
-                (
-                    'Certificate has expired or is about to expire.\n'
-                    'Certificate path: {path}\n'
-                    'Certificate subject: {subj}\n'
-                    'Expire date: {expire}'
-                ).format(path=certificate_abs_path, subj=cert_subject, expire=raw_expire_date)
-            )
-            return RETURN_CODE_WARNING
-
-        if env.info:
-            info(
-                (
-                    'Certificate path: {path}\n'
-                    'Certificate subject: {subj}\n'
-                    'Expire date: {expire}\n'
-                    'Valid after: {after}'
-                ).format(path=certificate_abs_path, subj=cert_subject, expire=raw_expire_date,
-                         after=info_fields.get('notBefore', '<unknown>'))
-            )
-        return RETURN_CODE_OK
+        return parse_and_check_certificate_info(info_res.stdout.decode('utf-8'), env,
+                                                certificate_description='file {}'.format(certificate_abs_path))
 
 
 class HttpsCheck(object):
 
     @staticmethod
     def init_argparser(subparsers):
-        parser = subparsers.add_parser(b'https', help='check a HTTPS certficate by receiving it from a SSL connection')
+        parser = subparsers.add_parser(b'https', help='check a HTTPS certificate by receiving it from a SSL connection')
         parser.add_argument('-s', '--host', type=str, required=True, metavar='example.com')
+        parser.add_argument('--sni', type=str, default=None, metavar='example.com',
+                            help='request SNI (for multiple certificats on one host:port)')
         parser.add_argument('-p', '--port', type=int, default=443, metavar='443')
         return parser
 
     def __call__(self, env):
-        print('https')
-        return RETURN_CODE_OK
+        host_fqn = '{}:{}'.format(env.host, env.port)
+        certificate_description = 'host {}'.format(host_fqn)
+        if env.sni is not None:
+            certificate_description += ' (SNI {})'.format(env.sni)
+
+        request_args = ['-connect', host_fqn]
+        if env.sni is not None:
+            request_args.extend(('-servername', env.sni))
+
+        request_res = s_client(request_args)
+        if request_res.return_code != 0:
+            warning('Unable to read certificate from {d}\n{r.stderr}'.format(d=certificate_description, r=request_res))
+            return RETURN_CODE_WARNING
+
+        info_res = x509(['-subject', '-dates', '-noout'], stdin=request_res.stdout)
+        if info_res.return_code != 0:
+            warning('Unable to read certificate info for {d}\n{r.stderr}'.format(d=certificate_description, r=info_res))
+            return RETURN_CODE_WARNING
+
+        return parse_and_check_certificate_info(info_res.stdout.decode('utf-8'), env, certificate_description)
 
 
 class PemCheck(object):

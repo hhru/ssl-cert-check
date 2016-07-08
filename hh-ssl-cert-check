@@ -7,6 +7,9 @@ import os
 import subprocess
 from collections import namedtuple
 import datetime
+import smtplib
+import socket
+from email.mime.text import MIMEText
 
 RETURN_CODE_OK = 0
 RETURN_CODE_WRONG_PARAMS = 1
@@ -24,6 +27,31 @@ def to_bytes(value):
 
 def warning(message):
     sys.stderr.write(message + '\n')
+
+
+class EmailReporter(object):
+
+    def __init__(self):
+        self._info = []
+
+    def add_additional_info(self, content):
+        self._info.append(content)
+
+    def send(self, to):
+        subject = 'Warn! Certificate has expired or is about to expire'
+        msg = MIMEText('\n'.join(self._info), _charset="utf-8")
+
+        hostname = socket.gethostname()
+        me = '{}@{}'.format(os.getlogin(), hostname)
+
+        msg[b'Subject'] = subject
+        msg[b'From'] = me
+        msg[b'To'] = to
+        msg[b'list-id'] = b'certificates warnings <certificates-warnings.{}>'.format(hostname)
+
+        s = smtplib.SMTP(b'localhost')  # TODO: additional smtp settings
+        s.sendmail(me, [to], msg.as_string())
+        s.quit()
 
 
 class EmailReporter(object):
@@ -76,9 +104,9 @@ def call_process(bin, args=None, stdin=None):
     :return CallProcessResult
     """
     if not is_executable_found(bin):
-        warning('''not found "{}", check if it's installed and exists somewhere in PATH ({})'''
-                .format(bin, os.environ.get('PATH', '')))
-        return CallProcessResult(bin_exists=False, return_code=None, stdout=None, stderr=None)
+        error = ('''not found "{}", check if it's installed and exists somewhere in PATH ({})'''
+                 .format(bin, os.environ.get('PATH', '')))
+        return CallProcessResult(bin_exists=False, return_code=None, stdout=None, stderr=error)
     args = args or []
     call_args = [bin] + args
     process = subprocess.Popen(call_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -137,10 +165,10 @@ def is_safe_expire_date(expire_date, expiration_interval, now=None):
     return delta >= datetime.timedelta(days=expiration_interval)
 
 
-def parse_and_check_certificate_info(content, env, certificate_description):
+def parse_and_check_certificate_info(content, env, certificate_description, warning_func=warning):
     info_fields = parse_certificate_fields(content)
     if 'notAfter' not in info_fields:
-        warning('Unable to read expire date for {}'.format(certificate_description))
+        warning_func('Unable to read expire date for {}'.format(certificate_description))
         return RETURN_CODE_WARNING
 
     raw_expire_date = info_fields['notAfter']
@@ -148,9 +176,9 @@ def parse_and_check_certificate_info(content, env, certificate_description):
     cert_subject = info_fields.get('subject', '<unknown>')
 
     if not is_safe_expire_date(expire_date, env.expiration_interval, now=env.now):
-        warning(
+        warning_func(
             (
-                'Certificate has expired or is about to expire.\n'
+                'Certificate has expired or is about to expire!\n\n'
                 'Certificate: {description}\n'
                 'Certificate subject: {subj}\n'
                 'Expire date: {expire}'
@@ -180,10 +208,10 @@ class P12Check(object):
         parser.add_argument('-p', '--password', type=str, help='certificate password')
         return parser
 
-    def __call__(self, env):
+    def __call__(self, env, warning_func=warning):
         certificate_abs_path = os.path.abspath(env.cert)
         if not os.path.isfile(certificate_abs_path):
-            warning('Certificate not found at {}'.format(certificate_abs_path))
+            warning_func('Certificate not found at {}'.format(certificate_abs_path))
             return RETURN_CODE_WRONG_PARAMS
 
         certificate_export_res = pkcs12([
@@ -192,17 +220,18 @@ class P12Check(object):
             '-passin', 'pass:{}'.format(env.password if env.password is not None else '')
         ])
         if certificate_export_res.return_code != 0:
-            warning('Unable to load certificate from {p}\n{r.stderr}'
+            warning_func('Unable to load certificate from {p}\n{r.stderr}'
                     .format(p=certificate_abs_path, r=certificate_export_res))
             return RETURN_CODE_WARNING
 
         info_res = x509(['-subject', '-dates', '-noout'], stdin=certificate_export_res.stdout)
         if info_res.return_code != 0:
-            warning('Unable to read certificate info for {p}\n{r.stderr}'.format(p=certificate_abs_path, r=info_res))
+            warning_func('Unable to read certificate info for {p}\n{r.stderr}'.format(p=certificate_abs_path, r=info_res))
             return RETURN_CODE_WARNING
 
         return parse_and_check_certificate_info(info_res.stdout.decode('utf-8'), env,
-                                                certificate_description='file {}'.format(certificate_abs_path))
+                                                certificate_description='file {}'.format(certificate_abs_path),
+                                                warning_func=warning_func)
 
 
 class HttpsCheck(object):
@@ -216,7 +245,7 @@ class HttpsCheck(object):
         parser.add_argument('-p', '--port', type=int, default=443, metavar='443')
         return parser
 
-    def __call__(self, env):
+    def __call__(self, env, warning_func=warning):
         host_fqn = '{}:{}'.format(env.host, env.port)
         certificate_description = 'host {}'.format(host_fqn)
         if env.sni is not None:
@@ -228,15 +257,18 @@ class HttpsCheck(object):
 
         request_res = s_client(request_args)
         if request_res.return_code != 0:
-            warning('Unable to read certificate from {d}\n{r.stderr}'.format(d=certificate_description, r=request_res))
+            warning_func('Unable to read certificate from {d}\n{r.stderr}'.format(d=certificate_description,
+                                                                                  r=request_res))
             return RETURN_CODE_WARNING
 
         info_res = x509(['-subject', '-dates', '-noout'], stdin=request_res.stdout)
         if info_res.return_code != 0:
-            warning('Unable to read certificate info for {d}\n{r.stderr}'.format(d=certificate_description, r=info_res))
+            warning_func('Unable to read certificate info for {d}\n{r.stderr}'.format(d=certificate_description,
+                                                                                      r=info_res))
             return RETURN_CODE_WARNING
 
-        return parse_and_check_certificate_info(info_res.stdout.decode('utf-8'), env, certificate_description)
+        return parse_and_check_certificate_info(info_res.stdout.decode('utf-8'), env, certificate_description,
+                                                warning_func)
 
 
 class PemCheck(object):
@@ -247,19 +279,21 @@ class PemCheck(object):
         parser.add_argument('-c', '--cert', type=str, help='certificate file path', required=True, metavar='file.crt')
         return parser
 
-    def __call__(self, env):
+    def __call__(self, env, warning_func=warning):
         certificate_abs_path = os.path.abspath(env.cert)
         if not os.path.isfile(certificate_abs_path):
-            warning('Certificate not found at {}'.format(certificate_abs_path))
+            warning_func('Certificate not found at {}'.format(certificate_abs_path))
             return RETURN_CODE_WRONG_PARAMS
 
         info_res = x509(['-in', certificate_abs_path, '-subject', '-dates', '-noout'])
         if info_res.return_code != 0:
-            warning('Unable to read certificate info for {d}\n{r.stderr}'.format(d=certificate_abs_path, r=info_res))
+            warning_func('Unable to read certificate info for {d}\n{r.stderr}'.format(d=certificate_abs_path,
+                                                                                      r=info_res))
             return RETURN_CODE_WARNING
 
         return parse_and_check_certificate_info(info_res.stdout.decode('utf-8'), env,
-                                                certificate_description='file {}'.format(certificate_abs_path))
+                                                certificate_description='file {}'.format(certificate_abs_path),
+                                                warning_func=warning_func)
 
 
 _COMMANDS = [P12Check, HttpsCheck, PemCheck]
@@ -271,6 +305,8 @@ def _parse_aguments(args):
                              help="print certificate info if it's valid")
     main_parser.add_argument('-x', '--expiration-interval', required=True, type=int, default=7, metavar='7',
                              help='expiration interval in days')
+    main_parser.add_argument('-e', '--email', type=str, metavar='ops@example.com',
+                             help='email for sending report if certificate has expired or is about to expire.')
 
     subparsers = main_parser.add_subparsers(title='commands', dest='command',
                                             help="use 'cmd -h' to see additional command specific help")
@@ -281,19 +317,31 @@ def _parse_aguments(args):
     for command in _COMMANDS:
         parser = command.init_argparser(subparsers)
         command_to_class[parser.prog.split(' ')[-1]] = command
-    parsed_arguments = main_parser.parse_args(args[1:])
-    selected_command = command_to_class[parsed_arguments.command]
-    return parsed_arguments, selected_command
+    env = main_parser.parse_args(args[1:])
+    selected_command = command_to_class[env.command]
+    return env, selected_command
 
 
 def main(args):
-    parsed_arguments, selected_command = _parse_aguments(args)
-    if parsed_arguments.expiration_interval < 0:
-        warning("Expiration interval should be >= 0")
+    env, selected_command = _parse_aguments(args)
+
+    email_reporter = None
+    warning_func = warning
+    if env.email:
+        email_reporter = EmailReporter()
+
+        def warning_func(message):
+            email_reporter.add_additional_info(message)
+            warning(message)
+
+    if env.expiration_interval < 0:
+        warning_func("Expiration interval should be >= 0")
         return RETURN_CODE_WRONG_PARAMS
     handler = selected_command()
-    return handler(parsed_arguments)
-
+    code = handler(env, warning_func=warning_func)
+    if code != RETURN_CODE_OK and email_reporter is not None:
+        email_reporter.send(env.email)
+    return code
 
 if __name__ == '__main__':
     sys.exit(main(sys.argv))

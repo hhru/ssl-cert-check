@@ -11,7 +11,7 @@
 
 Choose any of:
 
-* [Debian package](#LINK_WILL_BE_ADDED_AFTER_FIRST_RELEASE)
+* [.deb package](https://github.com/hhru/ssl-cert-check/releases/download/0.0.2/hh-ssl-cert-check_0.0.2_all.deb)
 * `pip install hh-ssl-cert-check`
 * Just get [hh-ssl-cert-check](./hh-ssl-cert-check) and use
 

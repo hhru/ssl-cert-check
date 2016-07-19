@@ -54,31 +54,6 @@ class EmailReporter(object):
         s.quit()
 
 
-class EmailReporter(object):
-
-    def __init__(self):
-        self._info = []
-
-    def add_additional_info(self, content):
-        self._info.append(content)
-
-    def send(self, to):
-        subject = 'Warn! Certificate has expired or is about to expire'
-        msg = MIMEText('\n'.join(self._info), _charset="utf-8")
-
-        hostname = socket.gethostname()
-        me = '{}@{}'.format(os.getlogin(), hostname)
-
-        msg[b'Subject'] = subject
-        msg[b'From'] = me
-        msg[b'To'] = to
-        msg[b'list-id'] = b'certificates warnings <certificates-warnings.{}>'.format(hostname)
-
-        s = smtplib.SMTP(b'localhost')  # TODO: additional smtp settings
-        s.sendmail(me, [to], msg.as_string())
-        s.quit()
-
-
 def is_executable_found(bin):
 
     def _is_exe(file_path):
@@ -162,7 +137,7 @@ def parse_date_field(value):
 
 def is_safe_expire_date(expire_date, expiration_interval, now=None):
     delta = expire_date - now
-    return delta >= datetime.timedelta(days=expiration_interval)
+    return delta >= datetime.timedelta(days=expiration_interval), delta
 
 
 def parse_and_check_certificate_info(content, env, certificate_description, warning_func=warning):
@@ -175,18 +150,22 @@ def parse_and_check_certificate_info(content, env, certificate_description, warn
     expire_date = parse_date_field(raw_expire_date)
     cert_subject = info_fields.get('subject', '<unknown>')
 
-    if not is_safe_expire_date(expire_date, env.expiration_interval, now=env.now):
+    is_safe, delta = is_safe_expire_date(expire_date, env.expiration_interval, now=env.now)
+    if not is_safe:
         warning_func(
             (
-                'Certificate has expired or is about to expire!\n\n'
+                'Certificate {reason}!\n\n'
                 'Certificate: {description}\n'
                 'Certificate subject: {subj}\n'
                 'Expire date: {expire}'
-            ).format(description=certificate_description, subj=cert_subject, expire=raw_expire_date)
+            ).format(description=certificate_description, subj=cert_subject, expire=raw_expire_date,
+                     reason='has expired' if delta.total_seconds() < 0 else 'is about to expire')
         )
-        return RETURN_CODE_WARNING
+        return_code = RETURN_CODE_WARNING
+    else:
+        return_code = RETURN_CODE_OK
 
-    if env.info:
+    if is_safe and env.info:
         print(
             (
                 'Certificate: {description}\n'
@@ -196,7 +175,9 @@ def parse_and_check_certificate_info(content, env, certificate_description, warn
             ).format(description=certificate_description, subj=cert_subject, expire=raw_expire_date,
                      after=info_fields.get('notBefore', '<unknown>'))
         )
-    return RETURN_CODE_OK
+    if env.seconds_until_expiration:
+        print('{:0.0f}'.format(delta.total_seconds()))
+    return return_code
 
 
 class P12Check(object):
@@ -221,12 +202,13 @@ class P12Check(object):
         ])
         if certificate_export_res.return_code != 0:
             warning_func('Unable to load certificate from {p}\n{r.stderr}'
-                    .format(p=certificate_abs_path, r=certificate_export_res))
+                         .format(p=certificate_abs_path, r=certificate_export_res))
             return RETURN_CODE_WARNING
 
         info_res = x509(['-subject', '-dates', '-noout'], stdin=certificate_export_res.stdout)
         if info_res.return_code != 0:
-            warning_func('Unable to read certificate info for {p}\n{r.stderr}'.format(p=certificate_abs_path, r=info_res))
+            warning_func('Unable to read certificate info for {p}\n{r.stderr}'
+                         .format(p=certificate_abs_path, r=info_res))
             return RETURN_CODE_WARNING
 
         return parse_and_check_certificate_info(info_res.stdout.decode('utf-8'), env,
@@ -303,6 +285,8 @@ def _parse_aguments(args):
     main_parser = argparse.ArgumentParser()
     main_parser.add_argument('-i', '--info', action='store_true',
                              help="print certificate info if it's valid")
+    main_parser.add_argument('--seconds-until-expiration', action='store_true',
+                             help="print seconds until expiration of the certificate")
     main_parser.add_argument('-x', '--expiration-interval', required=True, type=int, default=7, metavar='7',
                              help='expiration interval in days')
     main_parser.add_argument('-e', '--email', type=str, metavar='ops@example.com',

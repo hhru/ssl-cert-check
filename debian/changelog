@@ -1,3 +1,9 @@
+hh-ssl-cert-check (0.0.3) unstable; urgency=low
+
+  * Bump version up to 0.0.3
+
+ -- Automated Build <n.kovalev@hh.ru>  Wed, 20 Jul 2016 12:55:09 +0300
+
 hh-ssl-cert-check (0.0.2) unstable; urgency=low
 
   * Bump version up to 0.0.2

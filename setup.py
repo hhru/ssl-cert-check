@@ -1,6 +1,6 @@
 from setuptools import setup
 
-_version = '0.0.3'
+_version = '0.0.4'
 
 setup(
     name='hh-ssl-cert-check',

@@ -4,6 +4,7 @@ from __future__ import unicode_literals, print_function
 import sys
 import argparse
 import os
+import pwd
 import subprocess
 from collections import namedtuple
 import datetime
@@ -29,6 +30,13 @@ def warning(message):
     sys.stderr.write(message + '\n')
 
 
+def _get_login():
+    try:
+        return pwd.getpwuid(os.getuid())[0]
+    except Exception:
+        return unicode(os.getuid())
+
+
 class EmailReporter(object):
 
     def __init__(self):
@@ -42,7 +50,7 @@ class EmailReporter(object):
         msg = MIMEText('\n'.join(self._info), _charset="utf-8")
 
         hostname = socket.gethostname()
-        me = '{}@{}'.format(os.getlogin(), hostname)
+        me = '{}@{}'.format(_get_login(), hostname)
 
         msg[b'Subject'] = subject
         msg[b'From'] = me

@@ -195,6 +195,7 @@ class P12Check(object):
         parser = subparsers.add_parser(b'p12', help='check a certificate in a PKCS #12 container (.p12)')
         parser.add_argument('-c', '--cert', type=str, help='certificate file path', required=True, metavar='file.p12')
         parser.add_argument('-p', '--password', type=str, help='certificate password')
+        parser.add_argument('--password-file', type=str, help='file with certificate password')
         return parser
 
     def __call__(self, env, warning_func=warning):
@@ -203,10 +204,17 @@ class P12Check(object):
             warning_func('Certificate not found at {}'.format(certificate_abs_path))
             return RETURN_CODE_WRONG_PARAMS
 
+        if env.password is not None:
+            password = 'pass:{}'.format(env.password)
+        elif env.password_file is not None:
+            password = 'file:{}'.format(env.password_file)
+        else:
+            password = 'pass:'
+
         certificate_export_res = pkcs12([
             '-in', certificate_abs_path,
             '-nodes',  # don't encrypt private keys on exporting
-            '-passin', 'pass:{}'.format(env.password if env.password is not None else '')
+            '-passin', password
         ])
         if certificate_export_res.return_code != 0:
             warning_func('Unable to load certificate from {p}\n{r.stderr}'
